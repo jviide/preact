@@ -176,13 +176,21 @@ function constructNewChildrenArray(
 	let childVNode;
 	/** @type {VNode} */
 	let oldVNode;
+	/** @type {number | undefined} */
+	let lo;
+	/** @type {number} */
+	let hi;
+	/** @type {number} */
+	let mid;
+	/** @type {number[]} */
+	let piles = [];
 
 	let oldChildrenLength = oldChildren.length,
 		remainingOldChildren = oldChildrenLength;
 
 	let skew = 0;
 
-	newParentVNode._children = new Array(newChildrenLength);
+	let children = (newParentVNode._children = new Array(newChildrenLength));
 	for (i = 0; i < newChildrenLength; i++) {
 		// @ts-expect-error We are reusing the childVNode variable to hold both the
 		// pre and post normalized childVNode
@@ -193,7 +201,7 @@ function constructNewChildrenArray(
 			typeof childVNode == 'boolean' ||
 			typeof childVNode == 'function'
 		) {
-			newParentVNode._children[i] = NULL;
+			children[i] = NULL;
 			continue;
 		}
 		// If this newVNode is being reused (e.g. <div>{reuse}{reuse}</div>) in the same diff,
@@ -206,7 +214,7 @@ function constructNewChildrenArray(
 			typeof childVNode == 'bigint' ||
 			childVNode.constructor == String
 		) {
-			childVNode = newParentVNode._children[i] = createVNode(
+			childVNode = children[i] = createVNode(
 				NULL,
 				childVNode,
 				NULL,
@@ -214,7 +222,7 @@ function constructNewChildrenArray(
 				NULL
 			);
 		} else if (isArray(childVNode)) {
-			childVNode = newParentVNode._children[i] = createVNode(
+			childVNode = children[i] = createVNode(
 				Fragment,
 				{ children: childVNode },
 				NULL,
@@ -226,7 +234,7 @@ function constructNewChildrenArray(
 			// scenario:
 			//   const reuse = <div />
 			//   <div>{reuse}<span />{reuse}</div>
-			childVNode = newParentVNode._children[i] = createVNode(
+			childVNode = children[i] = createVNode(
 				childVNode.type,
 				childVNode.props,
 				childVNode.key,
@@ -234,12 +242,26 @@ function constructNewChildrenArray(
 				childVNode._original
 			);
 		} else {
-			newParentVNode._children[i] = childVNode;
+			children[i] = childVNode;
 		}
 
 		const skewedIndex = i + skew;
 		childVNode._parent = newParentVNode;
-		childVNode._depth = newParentVNode._depth + 1;
+
+		// Reuse `childVNode._depth` for Longest Increasing Subsequence (LIS) calculations
+		// for the duration of the current loop. The proper depth values will be restored
+		// in the subsequent loop.
+		//
+		// The value is the length of the longest increasing subsequence ending at this
+		// node, and is always > 0.
+		//
+		// Use `newChildrenLength` as a sentinel value for a node that was not in
+		// consideration to be included in the LIS.
+		//
+		// The only case when a node in the LIS can have `._depth == newChildrenLength`
+		// value after the current loop occurs is when *all* the nodes were in the LIS.
+		// The subsequent loop handles that case before checking the, um, sentinel-ness.
+		childVNode._depth = newChildrenLength;
 
 		// Temporarily store the matchingIndex on the _index property so we can pull
 		// out the oldVNode in diffChildren. We'll override this to the VNode's
@@ -251,78 +273,91 @@ function constructNewChildrenArray(
 			remainingOldChildren
 		));
 
-		oldVNode = NULL;
-		if (matchingIndex != -1) {
+		if (matchingIndex == -1) {
+			// When the array of children is growing we need to decrease the skew
+			// as we are adding a new element to the array.
+			// Example:
+			// [1, 2, 3] --> [0, 1, 2, 3]
+			// oldChildren   newChildren
+			//
+			// The new element is at index 0, so our skew is 0,
+			// we need to decrease the skew as we are adding a new element.
+			// The decrease will cause us to compare the element at position 1
+			// with value 1 with the element at position 0 with value 0.
+			//
+			// A linear concept is applied when the array is shrinking,
+			// if the length is unchanged we can assume that no skew
+			// changes are needed.
+			skew += Math.sign(oldChildrenLength - newChildrenLength);
+		} else {
 			oldVNode = oldChildren[matchingIndex];
 			remainingOldChildren--;
-			if (oldVNode) {
+
+			if (oldVNode != NULL) {
 				oldVNode._flags |= MATCHED;
+
+				// Nodes that are unsuspending (`oldVNode._original == null`) are considered mounting,
+				// and skipped here.
+				if (oldVNode._original != NULL) {
+					// Always skew the next search max. 1 step towards the current match.
+					//
+					// To restore the previous heuristics, do this instead:
+					//  if (matchingIndex == skewedIndex - 1) {
+					//    skew--;
+					//  } else if (matchingIndex == skewedIndex + 1) {
+					//    skew++;
+					//  } else {
+					//    skew += Math.sign(skewedIndex - matchingIndex);
+					//  }
+					skew += Math.sign(matchingIndex - skewedIndex);
+
+					// The previous iteration's `lo` value is preserved, allowing us to
+					// reuse it as the lower bound in the binary search when the
+					// matched index is larger than the previous one. Otherwise
+					// start from zero.
+					//
+					// In cases where all matched indexes are increasing this
+					// skips the binary search altogether.
+					lo = lo && piles[lo - 1] < matchingIndex ? lo : 0;
+					hi = piles.length;
+					while (lo < hi) {
+						// Assumes that `lo + hi` < 2^31, in which case `(lo + hi) >> 1` is safe.
+						// If we can only assume `lo + hi` < 2^32, then use `(lo + hi) >>> 1`.
+						// If even that doesn't hold, then go with `lo + ((hi - lo) >>> 1)`.
+						mid = (lo + hi) >> 1;
+						if (piles[mid] < matchingIndex) {
+							lo = mid + 1;
+						} else {
+							hi = mid;
+						}
+					}
+					piles[lo] = matchingIndex;
+					childVNode._depth = ++lo;
+				}
 			}
 		}
+	}
 
-		// Here, we define isMounting for the purposes of the skew diffing
-		// algorithm. Nodes that are unsuspending are considered mounting and we detect
-		// this by checking if oldVNode._original == null
-		if (oldVNode == NULL || oldVNode._original == NULL) {
-			if (matchingIndex == -1) {
-				// When the array of children is growing we need to decrease the skew
-				// as we are adding a new element to the array.
-				// Example:
-				// [1, 2, 3] --> [0, 1, 2, 3]
-				// oldChildren   newChildren
-				//
-				// The new element is at index 0, so our skew is 0,
-				// we need to decrease the skew as we are adding a new element.
-				// The decrease will cause us to compare the element at position 1
-				// with value 1 with the element at position 0 with value 0.
-				//
-				// A linear concept is applied when the array is shrinking,
-				// if the length is unchanged we can assume that no skew
-				// changes are needed.
-				if (newChildrenLength > oldChildrenLength) {
-					skew--;
-				} else if (newChildrenLength < oldChildrenLength) {
-					skew++;
-				}
-			}
-
-			// If we are mounting a DOM VNode, mark it for insertion
-			if (typeof childVNode.type != 'function') {
+	// Resolve which nodes belong in the longest increasing subsequence.
+	hi = piles.length;
+	while (i--) {
+		childVNode = children[i];
+		if (childVNode != NULL) {
+			if (childVNode._depth === hi) {
+				// This node is in the longest increasing subsequence, so it's already in the
+				// correct relative position.
+				hi--;
+			} else if (
+				childVNode._depth != newChildrenLength ||
+				typeof childVNode.type != 'function'
+			) {
+				// Matched children not in the LIS (any type) and mounting/unsuspending
+				// DOM VNodes get inserted. Mounting components do not, as their DOM nodes are
+				// inserted during the subtree mount.
 				childVNode._flags |= INSERT_VNODE;
 			}
-		} else if (matchingIndex != skewedIndex) {
-			// When we move elements around i.e. [0, 1, 2] --> [1, 0, 2]
-			// --> we diff 1, we find it at position 1 while our skewed index is 0 and our skew is 0
-			//     we set the skew to 1 as we found an offset.
-			// --> we diff 0, we find it at position 0 while our skewed index is at 2 and our skew is 1
-			//     this makes us increase the skew again.
-			// --> we diff 2, we find it at position 2 while our skewed index is at 4 and our skew is 2
-			//
-			// this becomes an optimization question where currently we see a 1 element offset as an insertion
-			// or deletion i.e. we optimize for [0, 1, 2] --> [9, 0, 1, 2]
-			// while a more than 1 offset we see as a swap.
-			// We could probably build heuristics for having an optimized course of action here as well, but
-			// might go at the cost of some bytes.
-			//
-			// If we wanted to optimize for i.e. only swaps we'd just do the last two code-branches and have
-			// only the first item be a re-scouting and all the others fall in their skewed counter-part.
-			// We could also further optimize for swaps
-			if (matchingIndex == skewedIndex - 1) {
-				skew--;
-			} else if (matchingIndex == skewedIndex + 1) {
-				skew++;
-			} else {
-				if (matchingIndex > skewedIndex) {
-					skew--;
-				} else {
-					skew++;
-				}
-
-				// Move this VNode's DOM if the original index (matchingIndex) doesn't
-				// match the new skew index (i + new skew)
-				// In the former two branches we know that it matches after skewing
-				childVNode._flags |= INSERT_VNODE;
-			}
+			// Restore ._depth as it's no longer needed for longest increasing subsequence bookkeeping.
+			childVNode._depth = newParentVNode._depth + 1;
 		}
 	}
 
